@@ -1,0 +1,10 @@
+# Build output (rebuild with `make build`; never commit a host-specific .so)
+*.so
+*.h
+/tmp/
+
+# Stray local build outputs
+cliproxy-rotator
+
+# Local exit pool snapshots (proxy lists are data, not source)
+proxies/
