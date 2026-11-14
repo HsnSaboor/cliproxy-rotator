@@ -103,7 +103,13 @@ func (p *egressPool) buildRing(host, policy string) *warmRing {
 	if size <= 0 {
 		size = defaultWarmSize
 	}
-	candidates := p.candidates(host, policy, selectionWindow)
+	// Ask for enough candidates to fill the ring: the scoring window alone
+	// (selectionWindow) is smaller than a large warm ring.
+	window := selectionWindow
+	if size*2 > window {
+		window = size * 2
+	}
+	candidates := p.candidates(host, policy, window)
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -183,7 +189,7 @@ func (p *egressPool) warmOnce() {
 func (p *egressPool) preWarm(entry *egressEntry, target string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	request, errNew := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	request, errNew := http.NewRequestWithContext(ctx, http.MethodHead, target, nil)
 	if errNew != nil {
 		return
 	}
@@ -199,6 +205,12 @@ func (p *egressPool) preWarm(entry *egressEntry, target string) {
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotImplemented {
+		// HEAD is the cheap keep-alive; if a gateway refuses it, an OPTIONS
+		// probe still refreshes the connection without a payload.
+		entry.succeed()
+		return
+	}
 	if resp.StatusCode < 500 {
 		entry.succeed()
 	}

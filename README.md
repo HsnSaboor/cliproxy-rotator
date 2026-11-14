@@ -171,6 +171,31 @@ So the rotation overhead — dial, TLS, and exit selection — is now inside the
 noise of the upstream's own time to first byte, and the tail is shorter than
 direct because a stalled exit is hedged away.
 
+The keep-alive is a `HEAD` request (the model list body is 624 KB; a GET every
+15 s across a large ring would move over 100 GB/day). `HEAD` returns 200 with
+an empty body, so the cost is a few hundred bytes of headers.
+
+### Sizing the warm ring
+
+Measured on this machine (`warm_pool_size` 8 → 32, 60 concurrent requests):
+
+| warm exits | RSS idle | RSS at 60-way peak | sockets | file descriptors |
+| --- | --- | --- | --- | --- |
+| 8 | 89.6 MB | — | 8 | 19 |
+| 32 | 98.8 MB | 110.6 MB | 37–52 | 71–88 |
+
+That is roughly **0.3 MB of RSS per warm exit** (idle connection + buffers).
+Prewarm traffic is a `HEAD` per exit per `warm_interval_seconds`: about
+**90 MB/day at 32 exits / 15 s**, versus ~40 GB/day for a full `GET`.
+
+Throughput is not limited by the ring: HTTP/2 multiplexes many streams over
+each warm socket, and 60 concurrent requests completed 60/60 in 5.6 s with a
+p50 time-to-first-byte of 1.4 s (the upstream throttles concurrency, not the
+socket count). What a bigger ring buys you is **more distinct source IPs**,
+which is what spreads a per-IP daily limit; raise it to the number of live
+exits (currently 34) for heavy use, and lower it when you want the smallest
+possible footprint.
+
 Streaming uses no context deadline (that would cut the body mid-stream);
 instead the pump enforces first-byte and idle budgets and always terminates the
 client stream, either with data + `[DONE]` or with a retryable error chunk.
