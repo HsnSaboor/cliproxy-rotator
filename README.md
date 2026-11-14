@@ -159,13 +159,20 @@ mechanisms remove that from the request path:
    returned, the loser's context is cancelled; on HTTP/2 the shared connection
    survives the cancelled stream.
 
-Interleaved against the same upstream, warm path vs. rotation before the change:
+Interleaved against the same upstream (9 pairs, warm ring 16, hedge 400 ms):
 
 ```
 before  rotator p50 1220 ms   (cold TLS every request, 6/6 connections new)
-after   rotator p50  740–990 ms, max 963–1270 ms
-        direct   p50  800–950 ms, max 1356 ms   (same window, no rotation)
+after   rotator p50 1143 ms, p90 1284, max 1801
+        direct  p50  875 ms, p90  960, max 1164   (same window, no rotation)
+earlier quieter window: rotator p50 739–989 ms, max 963–1270
 ```
+
+What is left is the proxy hop itself: `api.kilo.ai` publishes no AAAA record,
+so rotation has to leave through a SOCKS exit on another host, and that
+geographic round trip costs about 250 ms that no client-side trick removes.
+Connection setup (dial + TLS), which used to cost 320–410 ms per request, is
+now zero on the warm path.
 
 So the rotation overhead — dial, TLS, and exit selection — is now inside the
 noise of the upstream's own time to first byte, and the tail is shorter than
