@@ -8,3 +8,5 @@ cliproxy-rotator
 
 # Local exit pool snapshots (proxy lists are data, not source)
 proxies/
+__pycache__/
+*.pyc

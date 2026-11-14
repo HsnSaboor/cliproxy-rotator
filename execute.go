@@ -549,6 +549,31 @@ func pumpStream(streamID string, resp *http.Response, label string, idle time.Du
 		return
 	}
 	buffer := make([]byte, 32*1024)
+	// Emit exactly one SSE event per host callback. The host's responses-stream
+	// translator consumes a single event from each emitted chunk, so batching
+	// several frames into one call silently drops all but the first.
+	pending := make([]byte, 0, 64*1024)
+	flush := func(final bool) error {
+		for len(pending) > 0 {
+			idx := bytes.Index(pending, []byte("\n\n"))
+			cut := 0
+			if idx >= 0 {
+				cut = idx + 2
+			} else if final {
+				cut = len(pending)
+			} else {
+				return nil
+			}
+			if errEmit := emitChunk(streamID, pending[:cut]); errEmit != nil {
+				return errEmit
+			}
+			pending = append(pending[:0], pending[cut:]...)
+			if !final && idx < 0 {
+				return nil
+			}
+		}
+		return nil
+	}
 	timer := time.NewTimer(idle)
 	defer timer.Stop()
 	for {
@@ -565,12 +590,18 @@ func pumpStream(streamID string, resp *http.Response, label string, idle time.Du
 		select {
 		case result := <-resultChannel:
 			if result.n > 0 {
-				if errEmit := emitChunk(streamID, buffer[:result.n]); errEmit != nil {
+				pending = append(pending, buffer[:result.n]...)
+				if errEmit := flush(false); errEmit != nil {
 					hostLog("warn", "cliproxy-rotator: emit failed: "+errEmit.Error())
 					return
 				}
 			}
 			if result.err != nil {
+				// Deliver any trailing bytes that never got their newline.
+				if errEmit := flush(true); errEmit != nil {
+					hostLog("warn", "cliproxy-rotator: emit failed: "+errEmit.Error())
+					return
+				}
 				if result.err != io.EOF && !isBenignClose(result.err) {
 					closeStream(streamID, fmt.Sprintf("stream from %s broke: %v; retryable=true; retry_in=2s", label, result.err))
 				} else {
