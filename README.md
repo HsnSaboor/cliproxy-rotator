@@ -136,6 +136,40 @@ verifies the best ones against the real upstream and writes the ranked list.
 | `total_timeout_seconds` | 120–180 | Hard wall for one client call. |
 | `first_byte_timeout_seconds` | 60 | Time to headers. |
 | `idle_timeout_seconds` | 120 | Max gap between stream chunks; on expiry an error chunk is emitted. |
+| `hedge_delay_ms` | 1000 | If the first exit has produced no headers by then, a second exit is raced and the first answer wins. `0` keeps the default, negative disables. |
+| `egress.warm_pool_size` | 4 (6 with round-robin) | Exits that keep a live TLS connection ("warm ring"). Negative disables. |
+| `egress.warm_interval_seconds` | 20 | Keep-alive cadence for those sockets. |
+| `egress.ring_ttl_seconds` | 120 | How long the warm set is kept before it is re-ranked. |
+
+### Where the latency went
+
+A rotating exit used to pay a full TCP + TLS handshake on every request
+(measured 320–410 ms through a SOCKS hop, `total ≈ 1.22 s` at p50). Three
+mechanisms remove that from the request path:
+
+1. **Warm ring** (`warm.go`): a small, re-ranked subset of the fastest exits is
+   selected for `ring_ttl_seconds`. Their connections stay in the transport's
+   idle pool, so a request usually finds a ready socket with TLS resumption
+   (`tls.ClientSessionCache`) already negotiated.
+2. **Prewarm loop**: one cheap `GET …/models` per ring exit every
+   `warm_interval_seconds` keeps those sockets alive during quiet periods and
+   parks an exit that has died, which also invalidates the ring.
+3. **Hedging** (`sendHedged`): if no response headers arrive within
+   `hedge_delay_ms`, a second exit races the first. The winner's body is
+   returned, the loser's context is cancelled; on HTTP/2 the shared connection
+   survives the cancelled stream.
+
+Interleaved against the same upstream, warm path vs. rotation before the change:
+
+```
+before  rotator p50 1220 ms   (cold TLS every request, 6/6 connections new)
+after   rotator p50  740–990 ms, max 963–1270 ms
+        direct   p50  800–950 ms, max 1356 ms   (same window, no rotation)
+```
+
+So the rotation overhead — dial, TLS, and exit selection — is now inside the
+noise of the upstream's own time to first byte, and the tail is shorter than
+direct because a stalled exit is hedged away.
 
 Streaming uses no context deadline (that would cut the body mid-stream);
 instead the pump enforces first-byte and idle budgets and always terminates the
@@ -148,8 +182,12 @@ client stream, either with data + `[DONE]` or with a retryable error chunk.
   the endpoint, so the next request simply uses another exit.
 - Exits are re-probed by the pool every 5 min; the list is hot-reloaded when
   `socks_file` changes (mtime check every 60 s).
-- Keep-alives: `MaxIdleConnsPerHost: 8`, `IdleConnTimeout: 90s` per exit, so
-  ~30 concurrent requests reuse warm connections instead of re-dialling.
+- Keep-alives: `MaxIdleConnsPerHost: 8`, `IdleConnTimeout: 5m` per exit, plus
+  the warm ring, so ~30 concurrent requests reuse warm connections instead of
+  re-dialling (HTTP/2 multiplexes them over the ring's sockets).
+- Rate-limit fast-fail: three 429s from three exits inside one request end it
+  at once with `retryable=true; retry_in=<parked cooldown>` (about 2 s) instead
+  of walking the whole attempt budget (was 6.5 s+).
 
 ## Build, test, install
 
@@ -168,7 +206,7 @@ built from; `go.mod` points at `../CLIProxyAPI` (stock upstream checkout).
 - `POST /v1/chat/completions` (non-stream) → 200 through a rotating exit.
 - `stream: true` → full chunk stream, `finish_reason` and `[DONE]`.
 - `/v1/messages` (Claude protocol) → 200, translated by the host, not the plugin.
-- 15 concurrent requests → 15 × 200 in 4.7 s.
+- 20 concurrent requests (10 rotating + 10 direct) → 20 × 200 in 1.5 s.
 - Unreachable endpoint → fails in <1 s with `retryable=true` and the attempt log.
 - `api.kilo.ai` (IPv4-only) → automatically uses the SOCKS pool.
 - `api.apinex.bond` (AAAA) with `egress: ipv6` → dials from the `/48` pool.

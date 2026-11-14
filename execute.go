@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -126,21 +128,24 @@ func (r *runtime) timeout() time.Duration {
 	return 120 * time.Second
 }
 
+// hedgeDelay is how long a request may wait for response headers before a
+// second exit is raced. Negative disables hedging.
+func (r *runtime) hedgeDelay() time.Duration {
+	ms := r.cfg.HedgeDelayMs
+	if ms < 0 {
+		return 0
+	}
+	if ms == 0 {
+		ms = 550
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // send performs one upstream attempt through the best exit for the endpoint's
-// host, reporting which exit was used so caller can park it on 429s.
+// host, reporting which exit was used so caller can park it on 429s. When
+// hedging is enabled a second exit is raced if the first is slow to answer.
 func (r *runtime) send(call *upstreamCall, timeout time.Duration, stream bool) (*http.Response, *egressEntry, error) {
-	request, errNew := http.NewRequest(http.MethodPost, call.url, bytes.NewReader(call.body))
-	if errNew != nil {
-		return nil, nil, errNew
-	}
-	request.Header = call.headers.Clone()
-	host := strings.ToLower(request.URL.Hostname())
-	policy := policyAuto
-	if r.client != nil {
-		if p, ok := r.client.policy[host]; ok {
-			policy = p
-		}
-	}
+	host, policy := r.routeFor(call.url)
 	entry, cooldown := r.client.pool.pick(host, policy)
 	if entry == nil {
 		if cooldown > 0 {
@@ -151,30 +156,195 @@ func (r *runtime) send(call *upstreamCall, timeout time.Duration, stream bool) (
 	if timeout <= 0 {
 		timeout = r.timeout()
 	}
-	if timeout > 0 {
-		client := &http.Client{Transport: &singleEntryTransport{entry: entry}, Timeout: 0}
-		if !stream {
-			// Non-streaming calls are fully bounded by the request budget.
-			ctx, cancel := contextWithTimeout(timeout)
-			defer cancel()
-			request = request.WithContext(ctx)
-		}
-		started := time.Now()
-		entry.acquire()
-		resp, errDo := client.Do(request)
-		entry.release()
-		if errDo != nil {
-			entry.parkFor(errDo.Error(), false)
-			return nil, entry, errDo
-		}
-		entry.recordLatency(time.Since(started))
-		entry.succeed()
-		if socketDebug() != "" {
-			hostLog("debug", "cliproxy-rotator: egress "+entry.label+" ("+policy+") -> "+call.url)
-		}
-		return resp, entry, nil
+	if timeout <= 0 {
+		return nil, entry, fmt.Errorf("invalid timeout")
 	}
-	return nil, entry, fmt.Errorf("invalid timeout")
+	if hedge := r.hedgeDelay(); hedge > 0 {
+		return r.sendHedged(call, host, policy, entry, timeout, stream, hedge)
+	}
+	return r.attemptOnce(call, entry, policy, timeout, stream)
+}
+
+// routeFor resolves the egress policy configured for a URL's host.
+func (r *runtime) routeFor(rawURL string) (string, string) {
+	parsed, errParse := url.Parse(rawURL)
+	host := ""
+	if errParse == nil {
+		host = strings.ToLower(parsed.Hostname())
+	}
+	policy := policyAuto
+	if r.client != nil {
+		if p, ok := r.client.policy[host]; ok {
+			policy = p
+		}
+	}
+	return host, policy
+}
+
+// attemptOnce runs one attempt pinned to one exit.
+func (r *runtime) attemptOnce(call *upstreamCall, entry *egressEntry, policy string, timeout time.Duration, stream bool) (*http.Response, *egressEntry, error) {
+	request, errNew := http.NewRequest(http.MethodPost, call.url, bytes.NewReader(call.body))
+	if errNew != nil {
+		return nil, entry, errNew
+	}
+	request.Header = call.headers.Clone()
+	ctx, cancel := context.WithCancel(context.Background())
+	if !stream {
+		// Non-streaming calls are fully bounded by the request budget.
+		ctx, cancel = contextWithTimeout(timeout)
+	}
+	request = request.WithContext(ctx)
+	client := &http.Client{Transport: &singleEntryTransport{entry: entry}, Timeout: 0}
+	started := time.Now()
+	entry.acquire()
+	resp, errDo := client.Do(request)
+	entry.release()
+	if errDo != nil {
+		cancel()
+		if unreachableExit(errDo) {
+			// The exit itself is gone: hold it out for a few minutes
+			// instead of paying the dial timeout again on every call.
+			entry.parkDead(errDo.Error())
+		} else {
+			entry.parkFor(errDo.Error(), false)
+		}
+		return nil, entry, errDo
+	}
+	entry.recordLatency(time.Since(started))
+	entry.succeed()
+	// The context must outlive the call for a stream: cancel on body close.
+	resp.Body = cancelBody{ReadCloser: resp.Body, cancel: cancel}
+	if socketDebug() != "" {
+		hostLog("debug", "cliproxy-rotator: egress "+entry.label+" ("+policy+") -> "+call.url)
+	}
+	return resp, entry, nil
+}
+
+// sendHedged races a second exit when the first has not produced headers
+// within the hedge delay. The first acceptable answer wins and the other
+// attempt is cancelled, so a slow exit costs a few hundred milliseconds
+// instead of the whole first-byte budget.
+func (r *runtime) sendHedged(call *upstreamCall, host, policy string, first *egressEntry, timeout time.Duration, stream bool, hedge time.Duration) (*http.Response, *egressEntry, error) {
+	type outcome struct {
+		resp   *http.Response
+		entry  *egressEntry
+		err    error
+		handle *attemptHandle
+	}
+	results := make(chan outcome, 4)
+	launched := map[string]bool{}
+	var handles []*attemptHandle
+	cancelAll := func() {
+		for _, handle := range handles {
+			if handle != nil && handle.cancel != nil {
+				handle.cancel()
+			}
+		}
+	}
+	launch := func(entry *egressEntry) bool {
+		if entry == nil || launched[entry.label] {
+			return false
+		}
+		launched[entry.label] = true
+		request, errNew := http.NewRequest(http.MethodPost, call.url, bytes.NewReader(call.body))
+		if errNew != nil {
+			return false
+		}
+		request.Header = call.headers.Clone()
+		ctx, cancel := context.WithCancel(context.Background())
+		if !stream {
+			ctx, cancel = contextWithTimeout(timeout)
+		}
+		handle := &attemptHandle{cancel: cancel}
+		handles = append(handles, handle)
+		request = request.WithContext(ctx)
+		client := &http.Client{Transport: &singleEntryTransport{entry: entry}, Timeout: 0}
+		go func() {
+			started := time.Now()
+			entry.acquire()
+			resp, errDo := client.Do(request)
+			entry.release()
+			if errDo == nil {
+				entry.recordLatency(time.Since(started))
+			}
+			results <- outcome{resp: resp, entry: entry, err: errDo, handle: handle}
+		}()
+		return true
+	}
+
+	launch(first)
+	hedgeTimer := time.After(hedge)
+	var lastErr error
+	var lastEntry *egressEntry
+	pending := 1
+	exhausted := 0
+	for pending > 0 {
+		select {
+		case out := <-results:
+			pending--
+			if out.err != nil {
+				lastErr, lastEntry = out.err, out.entry
+				if unreachableExit(out.err) {
+					out.entry.parkDead(out.err.Error())
+				} else {
+					out.entry.parkFor(out.err.Error(), false)
+				}
+				if exhausted < r.attemptBudget() {
+					if next, _ := r.client.pool.pick(host, policy); launch(next) {
+						exhausted++
+						pending++
+					}
+				}
+				continue
+			}
+			if out.resp.StatusCode >= 500 {
+				// A 5xx is a failed attempt: keep the race going.
+				lastErr = fmt.Errorf("http %d", out.resp.StatusCode)
+				lastEntry = out.entry
+				out.entry.parkFor(lastErr.Error(), false)
+				_, _ = io.Copy(io.Discard, out.resp.Body)
+				out.resp.Body.Close()
+				if out.handle != nil && out.handle.cancel != nil {
+					out.handle.cancel()
+				}
+				if exhausted < r.attemptBudget() {
+					if next, _ := r.client.pool.pick(host, policy); launch(next) {
+						exhausted++
+						pending++
+					}
+				}
+				continue
+			}
+			// Winner: keep its context alive until the body is closed.
+			out.entry.succeed()
+			winnerCancel := context.CancelFunc(nil)
+			if out.handle != nil {
+				winnerCancel = out.handle.cancel
+			}
+			out.resp.Body = cancelBody{ReadCloser: out.resp.Body, cancel: winnerCancel}
+			for _, handle := range handles {
+				if handle == nil || handle == out.handle || handle.cancel == nil {
+					continue
+				}
+				handle.cancel() // abort the losing attempt
+			}
+			if socketDebug() != "" {
+				hostLog("debug", "cliproxy-rotator: hedged winner "+out.entry.label+" ("+policy+") -> "+call.url)
+			}
+			return out.resp, out.entry, nil
+		case <-hedgeTimer:
+			hedgeTimer = nil
+			if next, _ := r.client.pool.pick(host, policy); launch(next) {
+				pending++
+				exhausted++
+			}
+		}
+	}
+	cancelAll()
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no egress attempt completed for %s", host)
+	}
+	return nil, lastEntry, lastErr
 }
 
 // singleEntryTransport pins one request to one exit (so failures are attributable).
@@ -216,6 +386,8 @@ func execute(raw []byte) ([]byte, error) {
 	report := &failureReport{}
 	candidates := rt.candidatesFor(req.Model)
 	cursor := 0
+	rateLimited := 0
+	var retryIn time.Duration
 	for i := 0; i < attempts; i++ {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -256,8 +428,21 @@ func execute(raw []byte) ([]byte, error) {
 		}
 		rt.health.fail(slotKey(slot), fmt.Sprintf("http %d", resp.StatusCode))
 		report.add(call.label, fmt.Errorf("http %d", resp.StatusCode))
-		if rateLimitedStatus(resp.StatusCode) && usedExit != nil {
-			usedExit.parkFor("upstream http 429 (rate limited)", true)
+		if rateLimitedStatus(resp.StatusCode) {
+			rateLimited++
+			if usedExit != nil {
+				usedExit.parkFor("upstream http 429 (rate limited)", true)
+			}
+			if wait := rateLimitCooldown(usedExit); wait > retryIn {
+				retryIn = wait
+			}
+			// Three exits throttled for the same request means the model is
+			// throttled, not the path: fail fast with a retry hint instead of
+			// burning the rest of the attempt budget.
+			if rateLimited >= 3 {
+				return nil, fmt.Errorf("cliproxy-rotator: upstream is rate limiting this model on %d exits; retryable=true; retry_in=%.0fs; %s",
+					rateLimited, retryIn.Seconds(), report.String())
+			}
 		}
 		if !retryableStatus(resp.StatusCode) {
 			return nil, newStatusError(resp.StatusCode, fmt.Sprintf(
@@ -265,7 +450,7 @@ func execute(raw []byte) ([]byte, error) {
 				call.label, resp.StatusCode, clipBody(body)))
 		}
 	}
-	return nil, fmt.Errorf("cliproxy-rotator: request failed after %d attempts; %s; retryable=true", attempts, report.String())
+	return nil, fmt.Errorf("cliproxy-rotator: request failed after %d attempts; retryable=true; retry_in=%.0fs; %s", attempts, retryIn.Seconds(), report.String())
 }
 
 // executeStream starts the upstream stream in the background with strict
@@ -291,6 +476,8 @@ func executeStream(raw []byte) ([]byte, error) {
 	cursor := 0
 	var resp *http.Response
 	var call *upstreamCall
+	rateLimited := 0
+	var retryIn time.Duration
 	for i := 0; i < attempts; i++ {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -321,8 +508,18 @@ func executeStream(raw []byte) ([]byte, error) {
 		attempt.Body.Close()
 		rt.health.fail(slotKey(slot), fmt.Sprintf("http %d", attempt.StatusCode))
 		report.add(call.label, fmt.Errorf("http %d", attempt.StatusCode))
-		if rateLimitedStatus(attempt.StatusCode) && usedExit != nil {
-			usedExit.parkFor("upstream http 429 (rate limited)", true)
+		if rateLimitedStatus(attempt.StatusCode) {
+			rateLimited++
+			if usedExit != nil {
+				usedExit.parkFor("upstream http 429 (rate limited)", true)
+			}
+			if wait := rateLimitCooldown(usedExit); wait > retryIn {
+				retryIn = wait
+			}
+			if rateLimited >= 3 {
+				return nil, fmt.Errorf("cliproxy-rotator: upstream is rate limiting this model on %d exits; retryable=true; retry_in=%.0fs; %s",
+					rateLimited, retryIn.Seconds(), report.String())
+			}
 		}
 		if !retryableStatus(attempt.StatusCode) {
 			return nil, newStatusError(attempt.StatusCode, fmt.Sprintf(
@@ -331,7 +528,7 @@ func executeStream(raw []byte) ([]byte, error) {
 		}
 	}
 	if resp == nil {
-		return nil, fmt.Errorf("cliproxy-rotator: stream failed after %d attempts; %s; retryable=true", attempts, report.String())
+		return nil, fmt.Errorf("cliproxy-rotator: stream failed after %d attempts; retryable=true; retry_in=%.0fs; %s", attempts, retryIn.Seconds(), report.String())
 	}
 	streamID := req.StreamID
 	idle := time.Duration(rt.cfg.IdleSeconds) * time.Second

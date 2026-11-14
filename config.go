@@ -38,6 +38,18 @@ type egressConfig struct {
 	// SocksFallback is read when SocksFile is missing or yields no usable exit,
 	// so a fresh install starts from the warm pool shipped in this repository.
 	SocksFallback string `yaml:"socks_fallback"`
+	// Selection decides how an exit is picked from the pool:
+	// "round-robin" (default) walks the pool in order, so consecutive
+	// requests leave from different source addresses; "fastest" prefers the
+	// exit with the lowest observed latency.
+	Selection string `yaml:"selection"`
+	// WarmSize is how many exits keep a live TLS connection ("warm ring"):
+	// 0 selects the default (4, or 6 with round-robin), negative disables.
+	WarmSize int `yaml:"warm_pool_size"`
+	// WarmIntervalSeconds is the keep-alive cadence for those sockets.
+	WarmIntervalSeconds int `yaml:"warm_interval_seconds"`
+	// RingTTLSeconds is how long a warm set is kept before re-ranking.
+	RingTTLSeconds int `yaml:"ring_ttl_seconds"`
 }
 
 // modelConfig publishes one model id on the rotated provider.
@@ -57,19 +69,23 @@ type modelConfig struct {
 }
 
 type pluginConfig struct {
-	Enabled        *bool            `yaml:"enabled"`
-	Provider       string           `yaml:"provider"`
-	UserAgent      string           `yaml:"user_agent"`
-	Endpoints      []endpointConfig `yaml:"endpoints"`
-	Egress         egressConfig     `yaml:"egress"`
-	Models         []modelConfig    `yaml:"models"`
+	Enabled   *bool            `yaml:"enabled"`
+	Provider  string           `yaml:"provider"`
+	UserAgent string           `yaml:"user_agent"`
+	Endpoints []endpointConfig `yaml:"endpoints"`
+	Egress    egressConfig     `yaml:"egress"`
+	Models    []modelConfig    `yaml:"models"`
 
 	// Request time budgets: nothing waits forever. A request is abandoned with
 	// a clear retryable error as soon as its budget is exhausted.
-	TotalTimeoutSeconds int `yaml:"total_timeout_seconds"`     // whole request (non-stream), default 120
+	TotalTimeoutSeconds int `yaml:"total_timeout_seconds"`      // whole request (non-stream), default 120
 	FirstByteSeconds    int `yaml:"first_byte_timeout_seconds"` // stream: time to first upstream byte, default 60
 	IdleSeconds         int `yaml:"idle_timeout_seconds"`       // stream: idle gap allowed between chunks, default 120
 	MaxAttempts         int `yaml:"max_attempts"`               // total tries across slots, default 6
+	// HedgeDelayMs races a second exit when the first has not produced
+	// response headers within this delay. 0 keeps single-exit attempts, a
+	// negative value disables hedging explicitly.
+	HedgeDelayMs int `yaml:"hedge_delay_ms"`
 }
 
 // slot is one (endpoint, api key) rotation entry.
@@ -101,6 +117,7 @@ func defaultConfig() pluginConfig {
 		FirstByteSeconds:    60,
 		IdleSeconds:         120,
 		MaxAttempts:         6,
+		HedgeDelayMs:        550,
 	}
 }
 
@@ -126,6 +143,9 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 6
 	}
+	if cfg.HedgeDelayMs == 0 {
+		cfg.HedgeDelayMs = 550
+	}
 	cfg.Egress.Mode = strings.ToLower(strings.TrimSpace(cfg.Egress.Mode))
 	switch cfg.Egress.Mode {
 	case "", "auto", "ipv6+fallback":
@@ -138,6 +158,15 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 		cfg.Egress.Mode = "direct"
 	default:
 		return pluginConfig{}, fmt.Errorf("egress.mode %q is not one of auto, ipv6, socks, direct", cfg.Egress.Mode)
+	}
+	cfg.Egress.Selection = strings.ToLower(strings.TrimSpace(cfg.Egress.Selection))
+	switch cfg.Egress.Selection {
+	case "", selectionRoundRobin, "roundrobin", "rr":
+		cfg.Egress.Selection = selectionRoundRobin
+	case selectionFastest, "latency", "best":
+		cfg.Egress.Selection = selectionFastest
+	default:
+		return pluginConfig{}, fmt.Errorf("egress.selection %q is not one of round-robin, fastest", cfg.Egress.Selection)
 	}
 	if len(cfg.Endpoints) == 0 {
 		return pluginConfig{}, fmt.Errorf("endpoints is empty: at least one upstream URL is required")
@@ -313,21 +342,21 @@ func modelResponse() pluginapi.ModelResponse {
 			output = []string{"text"}
 		}
 		info := pluginapi.ModelInfo{
-			ID:                       m.ID,
-			Object:                   "model",
-			OwnedBy:                  owned,
-			Type:                     "openai-compatibility",
-			DisplayName:              display,
-			Name:                     name,
-			Description:              m.Description,
-			ContextLength:            m.ContextLength,
-			InputTokenLimit:          m.ContextLength,
-			MaxCompletionTokens:      m.MaxCompletionTokens,
-			OutputTokenLimit:         m.MaxCompletionTokens,
-			SupportedParameters:      m.SupportedParameters,
-			SupportedInputModalities: input,
+			ID:                        m.ID,
+			Object:                    "model",
+			OwnedBy:                   owned,
+			Type:                      "openai-compatibility",
+			DisplayName:               display,
+			Name:                      name,
+			Description:               m.Description,
+			ContextLength:             m.ContextLength,
+			InputTokenLimit:           m.ContextLength,
+			MaxCompletionTokens:       m.MaxCompletionTokens,
+			OutputTokenLimit:          m.MaxCompletionTokens,
+			SupportedParameters:       m.SupportedParameters,
+			SupportedInputModalities:  input,
 			SupportedOutputModalities: output,
-			UserDefined:              true,
+			UserDefined:               true,
 		}
 		if len(m.ThinkingLevels) > 0 {
 			info.Thinking = &pluginapi.ThinkingSupport{Levels: m.ThinkingLevels, ZeroAllowed: true, DynamicAllowed: true}
@@ -342,7 +371,15 @@ func hostLog(level, message string) {
 	if errMarshal != nil {
 		return
 	}
-	callHost("host.log", payload)
+	raw, errCall := callHost("host.log", payload)
+	if errCall != nil {
+		fmt.Fprintf(os.Stderr, "cliproxy-rotator: host.log failed: %v\n", errCall)
+		return
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal == nil && !env.OK && env.Error != nil {
+		fmt.Fprintf(os.Stderr, "cliproxy-rotator: host.log rejected: %s: %s\n", env.Error.Code, env.Error.Message)
+	}
 }
 
 func socketDebug() string {
