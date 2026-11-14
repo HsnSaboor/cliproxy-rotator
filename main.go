@@ -1,10 +1,12 @@
 // Command cliproxy-rotator is a CLIProxyAPI plugin that proxies requests to a
-// rotating set of OpenAI-compatible endpoints and egress addresses.
+// rotating set of upstream endpoints and egress addresses.
 //
-// The plugin deliberately owns no API-format logic: CLIProxyAPI translates the
-// client protocol (claude / codex-responses / gemini / openai-chat) into
-// "chat-completions" before calling the executor, and translates the reply
-// back. Everything this plugin does is:
+// The plugin does not translate API formats. The upstream this plugin targets
+// speaks all three client protocols natively (chat-completions, OpenAI
+// responses and Anthropic messages), so the plugin declares all three as its
+// input and output formats: CLIProxyAPI then hands the client's own payload
+// to the executor and forwards the upstream bytes back untouched. Everything
+// this plugin does is:
 //
 //   - round-robin over the configured endpoint list,
 //   - round-robin over each endpoint's API keys (an empty key = anonymous),
@@ -222,8 +224,8 @@ func pluginRegistration() registration {
 			ModelRouter:           true,
 			Executor:              true,
 			ExecutorModelScope:    string(pluginapi.ExecutorModelScopeStatic),
-			ExecutorInputFormats:  []string{"chat-completions"},
-			ExecutorOutputFormats: []string{"chat-completions"},
+			ExecutorInputFormats:  []string{"openai", "openai-response", "claude", "codex"},
+			ExecutorOutputFormats: []string{"openai", "openai-response", "claude", "codex"},
 		},
 	}
 }

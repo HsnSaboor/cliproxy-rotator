@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -96,6 +97,15 @@ func (r *runtime) prepare(slot slot, req *rpcExecutorRequest, stream bool) *upst
 		userAgent = "cliproxy-rotator/1.0"
 	}
 	headers.Set("User-Agent", userAgent)
+	if strings.HasSuffix(upstreamPath(req.Format), "/messages") {
+		// Anthropic-protocol upstreams want a version header; forward the
+		// client's own when present, otherwise state the current one.
+		if existing := req.Headers.Get("Anthropic-Version"); existing != "" {
+			headers.Set("Anthropic-Version", existing)
+		} else {
+			headers.Set("Anthropic-Version", "2023-06-01")
+		}
+	}
 	if slot.apiKey != "" {
 		headers.Set("Authorization", "Bearer "+slot.apiKey)
 	}
@@ -377,6 +387,7 @@ func execute(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode executor request: %w", errUnmarshal)
 	}
+	debugFormat(&req, false)
 	rt := loadedRuntime()
 	if len(rt.slots) == 0 {
 		return nil, fmt.Errorf("cliproxy-rotator: no endpoints configured; add endpoints to the plugin config and restart")
@@ -461,6 +472,7 @@ func executeStream(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode executor stream request: %w", errUnmarshal)
 	}
+	debugFormat(&req, true)
 	rt := loadedRuntime()
 	if len(rt.slots) == 0 {
 		return nil, fmt.Errorf("cliproxy-rotator: no endpoints configured; add endpoints to the plugin config and restart")
@@ -660,4 +672,14 @@ func flatHeaders(headers http.Header) http.Header {
 		out[name] = headers[name]
 	}
 	return out
+}
+
+// debugFormat logs the protocol formats the host handed to the executor so a
+// mis-declared capability (which would force translation) is visible.
+func debugFormat(req *rpcExecutorRequest, stream bool) {
+	if os.Getenv("ROTATOR_DEBUG_FMT") == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "cliproxy-rotator: format=%q source=%q stream=%v path=%s model=%s\n",
+		req.Format, req.SourceFormat, stream, upstreamPath(req.Format), req.Model)
 }
