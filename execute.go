@@ -547,24 +547,105 @@ func executeStream(raw []byte) ([]byte, error) {
 	if idle <= 0 {
 		idle = 120 * time.Second
 	}
-	go pumpStream(streamID, resp, call.label, idle)
+	// A stream that dies before delivering a single byte is retried on a fresh
+	// exit. Reopening stops as soon as any byte reached the client, because a
+	// second response would duplicate text.
+	reopenBudget := rt.attemptBudget()
+	reopen := func() (*http.Response, string, error) {
+		for reopenBudget > 0 {
+			reopenBudget--
+			slotNext, _, okNext := rt.takeCandidate(candidates, &cursor)
+			if !okNext {
+				return nil, "", fmt.Errorf("all endpoints are cooling down")
+			}
+			nextCall := rt.prepare(slotNext, &req, true)
+			r, _, errSend := rt.send(nextCall, rt.timeout(), true)
+			if errSend != nil {
+				rt.health.fail(slotKey(slotNext), errSend.Error())
+				continue
+			}
+			if r.StatusCode >= 200 && r.StatusCode < 300 {
+				return r, nextCall.label, nil
+			}
+			rt.health.fail(slotKey(slotNext), fmt.Sprintf("http %d", r.StatusCode))
+			_, _ = io.Copy(io.Discard, r.Body)
+			r.Body.Close()
+		}
+		return nil, "", fmt.Errorf("retry budget exhausted")
+	}
+	go pumpStream(streamID, resp, call.label, idle, reopen)
 	return okEnvelope(map[string]any{})
 }
 
 // pumpStream copies upstream bytes into host stream chunks, enforcing an idle
 // budget: if no chunk arrives for `idle`, the stream is closed with an error
-// chunk so the agent sees "retry" instead of a hanging connection.
-func pumpStream(streamID string, resp *http.Response, label string, idle time.Duration) {
-	defer resp.Body.Close()
+// chunk so the agent sees "retry" instead of a hanging connection. If the exit
+// dies before delivering a single byte (no terminal event either), the request
+// is transparently reopened on a fresh exit: nothing was emitted yet, so the
+// client cannot see the retry.
+func pumpStream(streamID string, resp *http.Response, label string, idle time.Duration, reopen func() (*http.Response, string, error)) {
+	defer func() {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+	}()
 	if streamID == "" {
 		_, _ = io.ReadAll(resp.Body)
 		return
 	}
+	for reopens := 0; ; reopens++ {
+		terminal, emitted, errText := pumpOnce(streamID, resp, label, idle)
+		resp.Body.Close()
+		if terminal || emitted > 0 || reopen == nil {
+			closeStream(streamID, errText)
+			return
+		}
+		next, nextLabel, errReopen := reopen()
+		if errReopen != nil {
+			// Nothing usable left: tell the client to retry rather than
+			// ending the turn with an empty stream.
+			closeStream(streamID, fmt.Sprintf("stream from %s closed before any data and no exit was left to retry (%s); retryable=true; retry_in=2s", label, errReopen.Error()))
+			return
+		}
+		hostLog("debug", fmt.Sprintf("cliproxy-rotator: %s closed with no data, retried on %s", label, nextLabel))
+		resp, label = next, nextLabel
+	}
+}
+
+// terminalEvent reports whether one SSE event block ends the stream.
+func terminalEvent(block []byte) bool {
+	if bytes.Contains(block, []byte("[DONE]")) {
+		return true
+	}
+	for _, marker := range []string{
+		`"type":"message_stop"`,
+		`"type":"response.completed"`,
+		`"type":"response.failed"`,
+		`"type":"response.incomplete"`,
+		`"type":"response.done"`,
+	} {
+		if bytes.Contains(block, []byte(marker)) {
+			return true
+		}
+	}
+	// chat-completions finishes with a non-null finish_reason.
+	if bytes.Contains(block, []byte(`"finish_reason":"`)) {
+		return true
+	}
+	return false
+}
+
+// pumpOnce forwards one response body. It reports whether a terminal event was
+// seen, how many bytes reached the client, and an error text to close with when
+// the stream broke after real data had already been delivered.
+func pumpOnce(streamID string, resp *http.Response, label string, idle time.Duration) (bool, int, string) {
 	buffer := make([]byte, 32*1024)
 	// Emit exactly one SSE event per host callback. The host's responses-stream
 	// translator consumes a single event from each emitted chunk, so batching
 	// several frames into one call silently drops all but the first.
 	pending := make([]byte, 0, 64*1024)
+	terminal := false
+	emitted := 0
 	flush := func(final bool) error {
 		for len(pending) > 0 {
 			idx := bytes.Index(pending, []byte("\n\n"))
@@ -576,9 +657,14 @@ func pumpStream(streamID string, resp *http.Response, label string, idle time.Du
 			} else {
 				return nil
 			}
-			if errEmit := emitChunk(streamID, pending[:cut]); errEmit != nil {
+			block := pending[:cut]
+			if terminalEvent(block) {
+				terminal = true
+			}
+			if errEmit := emitChunk(streamID, block); errEmit != nil {
 				return errEmit
 			}
+			emitted += cut
 			pending = append(pending[:0], pending[cut:]...)
 			if !final && idx < 0 {
 				return nil
@@ -605,25 +691,28 @@ func pumpStream(streamID string, resp *http.Response, label string, idle time.Du
 				pending = append(pending, buffer[:result.n]...)
 				if errEmit := flush(false); errEmit != nil {
 					hostLog("warn", "cliproxy-rotator: emit failed: "+errEmit.Error())
-					return
+					return terminal, emitted, ""
 				}
 			}
 			if result.err != nil {
 				// Deliver any trailing bytes that never got their newline.
 				if errEmit := flush(true); errEmit != nil {
 					hostLog("warn", "cliproxy-rotator: emit failed: "+errEmit.Error())
-					return
+					return terminal, emitted, ""
 				}
 				if result.err != io.EOF && !isBenignClose(result.err) {
-					closeStream(streamID, fmt.Sprintf("stream from %s broke: %v; retryable=true; retry_in=2s", label, result.err))
-				} else {
-					closeStream(streamID, "")
+					if emitted == 0 {
+						return terminal, 0, ""
+					}
+					return terminal, emitted, fmt.Sprintf("stream from %s broke: %v; retryable=true; retry_in=2s", label, result.err)
 				}
-				return
+				return terminal, emitted, ""
 			}
 		case <-timer.C:
-			closeStream(streamID, fmt.Sprintf("no data from %s for %s; retryable=true; retry_in=2s", label, idle.Round(time.Second)))
-			return
+			if emitted == 0 {
+				return terminal, 0, ""
+			}
+			return terminal, emitted, fmt.Sprintf("no data from %s for %s; retryable=true; retry_in=2s", label, idle.Round(time.Second))
 		}
 	}
 }
