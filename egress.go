@@ -253,6 +253,17 @@ type egressPool struct {
 	// probeTarget is the host:port the proxy exits are probed against.
 	probeTarget string
 
+	// probing guards the background probe so only one round runs at a time.
+	probing atomic.Bool
+
+	// The configuration the pool was built with. A reconfigure that keeps the
+	// same egress settings reuses the pool, which preserves the probe
+	// results, the parked exits, the warm ring and the latency history.
+	built       egressConfig
+	builtPrefix []string
+	builtStatic []string
+	builtTarget string
+
 	// Warm ring: a small stable subset of exits whose TLS connections stay
 	// open, so a request does not pay a handshake every time.
 	ringsMu   sync.Mutex
@@ -277,6 +288,9 @@ func newEgressPool(cfg egressConfig, endpoints []endpointConfig) (*egressPool, e
 		rings:     make(map[ringKey]*warmRing),
 	}
 	pool.configureWarmRing(cfg)
+	pool.built = cfg
+	pool.builtPrefix = append([]string(nil), cfg.Prefixes...)
+	pool.builtStatic = append([]string(nil), cfg.Socks...)
 	for _, raw := range cfg.Prefixes {
 		_, network, errParse := net.ParseCIDR(strings.TrimSpace(raw))
 		if errParse != nil {
@@ -319,6 +333,7 @@ func newEgressPool(cfg egressConfig, endpoints []endpointConfig) (*egressPool, e
 	// Probe the proxy exits in the background so dead ones never cost a
 	// request their dial timeout.
 	pool.probeTarget = probeTarget(endpoints)
+	pool.builtTarget = pool.probeTarget
 	if pool.probeTarget != "" && pool.mode != policyDirect {
 		go pool.probeAll(pool.probeTarget)
 	}
@@ -354,6 +369,62 @@ func probeTarget(endpoints []endpointConfig) string {
 		return net.JoinHostPort(host, port)
 	}
 	return ""
+}
+
+// reusable reports whether the pool can serve the given configuration as it
+// stands. Reusing it keeps the probe results, the parked exits, the warm ring
+// and the latency history, so a reconfigure does not restart the background
+// probe or throw away what the plugin already learned.
+func (p *egressPool) reusable(cfg egressConfig, endpoints []endpointConfig) bool {
+	if p == nil {
+		return false
+	}
+	if p.mode != cfg.Mode ||
+		p.iface != cfg.Interface ||
+		p.poolSize != cfg.PoolSize ||
+		p.socksFile != cfg.SocksFile ||
+		p.selection != cfg.Selection {
+		return false
+	}
+	size, every, ttl := effectiveWarm(cfg, p.selection)
+	if p.warmSize != size || p.warmEvery != every || p.ringTTL != ttl {
+		return false
+	}
+	if len(p.builtPrefix) != len(cfg.Prefixes) {
+		return false
+	}
+	for i := range p.builtPrefix {
+		if !samePrefix(p.builtPrefix[i], cfg.Prefixes[i]) {
+			return false
+		}
+	}
+	if !sameStringList(p.builtStatic, cfg.Socks) {
+		return false
+	}
+	return p.builtTarget == probeTarget(endpoints)
+}
+
+// samePrefix compares two CIDR strings by their parsed network.
+func samePrefix(left, right string) bool {
+	_, leftNet, errLeft := net.ParseCIDR(strings.TrimSpace(left))
+	_, rightNet, errRight := net.ParseCIDR(strings.TrimSpace(right))
+	if errLeft != nil || errRight != nil {
+		return strings.TrimSpace(left) == strings.TrimSpace(right)
+	}
+	return leftNet.String() == rightNet.String()
+}
+
+// sameStringList compares two string lists element by element.
+func sameStringList(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // acquire marks the entry busy so scoring spreads 30-way concurrency.
@@ -601,6 +672,10 @@ func (p *egressPool) probeHostAAAA(host string) bool {
 }
 
 // reloadSocksFileIfChanged re-reads the socks list when the file changes.
+//
+// The entries that are still in the pool keep their state: a proxy that was
+// parked stays parked and a proxy that answered before keeps its warm socket
+// and its latency history. Only exits that were never seen are probed.
 func (p *egressPool) reloadSocksFileIfChanged() {
 	if p.socksFile == "" {
 		return
@@ -610,23 +685,42 @@ func (p *egressPool) reloadSocksFileIfChanged() {
 		p.socksMu.Unlock()
 		return
 	}
+	p.socksLoaded = time.Now()
+	previous := p.socks
+	p.socksMu.Unlock()
+
 	exits, errRead := readSocksFile(p.socksFile)
 	if errRead != nil {
-		p.socksMu.Unlock()
 		return
 	}
-	entries := parseSocksEntries(exits)
-	parsed := exits
-	p.socks = entries
-	p.socksLoaded = time.Now()
-	p.socksMu.Unlock()
-	if len(parsed) > 0 {
-		hostLog("info", fmt.Sprintf("cliproxy-rotator: reloaded socks list from %s: %d exits", p.socksFile, len(entries)))
-		// The fresh list has not been vetted yet: probe it in the background
-		// so a dead proxy never has to be discovered inside a request.
-		if target := p.probeTarget; target != "" {
-			go p.probeAll(target)
+	if len(exits) == 0 {
+		return
+	}
+	fresh := parseSocksEntries(exits)
+	byLabel := make(map[string]*egressEntry, len(previous))
+	for _, entry := range previous {
+		byLabel[entry.label] = entry
+	}
+	entries := make([]*egressEntry, 0, len(fresh))
+	added := make([]*egressEntry, 0, len(fresh))
+	for _, entry := range fresh {
+		if existing, ok := byLabel[entry.label]; ok {
+			entries = append(entries, existing)
+			continue
 		}
+		entries = append(entries, entry)
+		added = append(added, entry)
+	}
+	p.socksMu.Lock()
+	p.socks = entries
+	p.socksMu.Unlock()
+
+	hostLog("info", fmt.Sprintf("cliproxy-rotator: reloaded socks list from %s: %d exits (%d new)",
+		p.socksFile, len(entries), len(added)))
+	// Only the exits that were never seen need a probe: the others already
+	// answered a request or are already parked.
+	if target := p.probeTarget; target != "" && len(added) > 0 {
+		go p.probeFresh(target, added)
 	}
 }
 

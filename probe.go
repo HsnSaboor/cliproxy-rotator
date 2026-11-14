@@ -27,16 +27,44 @@ const probeConcurrency = 8
 // died minutes ago. Without this probe the plugin would only learn that a
 // proxy is dead by paying its dial timeout inside a real request.
 func (p *egressPool) probeAll(target string) {
-	if target == "" {
-		return
-	}
 	p.socksMu.Lock()
 	entries := append([]*egressEntry(nil), p.socks...)
 	p.socksMu.Unlock()
-	if len(entries) == 0 {
+	p.probeEntries(target, entries)
+}
+
+// probeFresh checks only the exits that have never been measured. It is used
+// after the pool file changed: exits that already answered a request are
+// trusted until they fail, and exits that already failed stay parked.
+func (p *egressPool) probeFresh(target string, candidates []*egressEntry) {
+	fresh := make([]*egressEntry, 0, len(candidates))
+	for _, entry := range candidates {
+		if entry == nil {
+			continue
+		}
+		if entry.samples.Load() == 0 && entry.failures.Load() == 0 {
+			fresh = append(fresh, entry)
+		}
+	}
+	p.probeEntries(target, fresh)
+}
+
+// probeEntries runs one probe round. Only one round runs at a time: the host
+// re-applies the plugin configuration several times during startup, and five
+// overlapping rounds would hammer the proxy pool for no benefit.
+func (p *egressPool) probeEntries(target string, entries []*egressEntry) {
+	if target == "" || len(entries) == 0 {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "cliproxy-rotator probe: start %d exits against %s\n", len(entries), target)
+	if !p.probing.CompareAndSwap(false, true) {
+		return
+	}
+	defer p.probing.Store(false)
+
+	debug := socketDebug() != ""
+	if debug {
+		fmt.Fprintf(os.Stderr, "cliproxy-rotator probe: %d exit(s) against %s\n", len(entries), target)
+	}
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, probeConcurrency)
 	for _, entry := range entries {
@@ -46,7 +74,9 @@ func (p *egressPool) probeAll(target string) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			if err := probeProxyExit(e, target); err != nil {
-				fmt.Fprintf(os.Stderr, "cliproxy-rotator probe: %s dead: %v\n", e.label, err)
+				if debug {
+					fmt.Fprintf(os.Stderr, "cliproxy-rotator probe: %s dead: %v\n", e.label, err)
+				}
 				e.parkDead(err.Error())
 				return
 			}
@@ -54,16 +84,19 @@ func (p *egressPool) probeAll(target string) {
 		}(entry)
 	}
 	wg.Wait()
+
 	alive := 0
 	for _, entry := range entries {
 		if entry.usable() {
 			alive++
 		}
 	}
-	fmt.Fprintf(os.Stderr, "cliproxy-rotator probe: DONE %d exits, %d reachable (about to hostLog)\n", len(entries), alive)
-	hostLog("info", fmt.Sprintf("cliproxy-rotator: probed %d proxy exit(s) against %s: %d reachable",
-		len(entries), target, alive))
-	fmt.Fprintf(os.Stderr, "cliproxy-rotator probe: hostLog returned\n")
+	message := fmt.Sprintf("cliproxy-rotator: probed %d proxy exit(s) against %s: %d reachable",
+		len(entries), target, alive)
+	hostLog("info", message)
+	// The host keeps its own log in a file once the configuration is applied,
+	// so mirror the summary on stderr to keep it visible in the journal.
+	fmt.Fprintln(os.Stderr, message)
 }
 
 // probeProxyExit dials the proxy and asks it to connect to target.

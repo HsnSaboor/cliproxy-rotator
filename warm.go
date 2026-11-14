@@ -252,26 +252,37 @@ type attemptHandle struct {
 // configureWarmRing applies the configuration knobs. Zero values keep the
 // defaults, so an untouched config still gets warm connections.
 func (p *egressPool) configureWarmRing(cfg egressConfig) {
-	p.warmSize = cfg.WarmSize
-	if p.warmSize == 0 {
-		p.warmSize = defaultWarmSize
-		if p.selection == selectionRoundRobin {
+	size, every, ttl := effectiveWarm(cfg, p.selection)
+	p.warmSize = size
+	p.warmEvery = every
+	p.ringTTL = ttl
+}
+
+// effectiveWarm resolves the warm-ring settings, applying the defaults for
+// the values the configuration leaves at zero. The pool and the reuse check
+// both use it, so they always agree.
+func effectiveWarm(cfg egressConfig, selection string) (int, time.Duration, time.Duration) {
+	size := cfg.WarmSize
+	if size == 0 {
+		size = defaultWarmSize
+		if selection == selectionRoundRobin {
 			// Rotation still spreads rate limits: a wider ring keeps more
 			// source addresses in play without paying a handshake each time.
-			p.warmSize = defaultWarmSize + 2
+			size = defaultWarmSize + 2
 		}
 	}
-	if p.warmSize < 0 {
-		p.warmSize = 0 // negative disables the ring entirely
+	if size < 0 {
+		size = 0 // negative disables the ring entirely
 	}
-	p.warmEvery = time.Duration(cfg.WarmIntervalSeconds) * time.Second
-	if p.warmEvery <= 0 {
-		p.warmEvery = defaultWarmEvery
+	every := time.Duration(cfg.WarmIntervalSeconds) * time.Second
+	if every <= 0 {
+		every = defaultWarmEvery
 	}
-	p.ringTTL = time.Duration(cfg.RingTTLSeconds) * time.Second
-	if p.ringTTL <= 0 {
-		p.ringTTL = defaultRingTTL
+	ttl := time.Duration(cfg.RingTTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = defaultRingTTL
 	}
+	return size, every, ttl
 }
 
 // warmTarget is the cheap endpoint used to keep ring sockets alive. The model

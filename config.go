@@ -212,11 +212,11 @@ func configure(raw []byte) error {
 	if errDecode != nil {
 		return errDecode
 	}
-	rt, errBuild := buildRuntime(cfg)
+	previous, _ := activeConfig.Load().(*runtime)
+	rt, errBuild := buildRuntime(cfg, previous)
 	if errBuild != nil {
 		return errBuild
 	}
-	previous, _ := activeConfig.Load().(*runtime)
 	activeConfig.Store(rt)
 	if previous != nil && previous.egress != nil && previous.egress != rt.egress {
 		previous.egress.Close()
@@ -224,7 +224,7 @@ func configure(raw []byte) error {
 	return nil
 }
 
-func buildRuntime(cfg pluginConfig) (*runtime, error) {
+func buildRuntime(cfg pluginConfig, previous *runtime) (*runtime, error) {
 	rt := &runtime{cfg: cfg, provider: cfg.Provider, models: cfg.Models}
 	for i := range cfg.Endpoints {
 		ep := &cfg.Endpoints[i]
@@ -236,9 +236,19 @@ func buildRuntime(cfg pluginConfig) (*runtime, error) {
 			rt.slots = append(rt.slots, slot{endpoint: ep, apiKey: strings.TrimSpace(key)})
 		}
 	}
-	egress, errEgress := newEgressPool(cfg.Egress, cfg.Endpoints)
-	if errEgress != nil {
-		return nil, errEgress
+	// The host re-applies the plugin configuration several times during
+	// startup. Reusing the egress pool keeps its probe results, its parked
+	// exits, its warm ring and its latency history, and it keeps the
+	// background probe from running once per reconfigure.
+	var egress *egressPool
+	if previous != nil && previous.egress != nil && previous.egress.reusable(cfg.Egress, cfg.Endpoints) {
+		egress = previous.egress
+	} else {
+		var errEgress error
+		egress, errEgress = newEgressPool(cfg.Egress, cfg.Endpoints)
+		if errEgress != nil {
+			return nil, errEgress
+		}
 	}
 	rt.egress = egress
 	rt.health = newHealth()
@@ -366,6 +376,10 @@ func modelResponse() pluginapi.ModelResponse {
 	return pluginapi.ModelResponse{Provider: rt.provider, Models: models}
 }
 
+// hostAttached records whether the host callback ever worked. Without it the
+// plugin runs standalone (unit tests), and a failed host.log is expected.
+var hostAttached atomic.Bool
+
 func hostLog(level, message string) {
 	payload, errMarshal := json.Marshal(map[string]string{"level": level, "message": message})
 	if errMarshal != nil {
@@ -373,13 +387,19 @@ func hostLog(level, message string) {
 	}
 	raw, errCall := callHost("host.log", payload)
 	if errCall != nil {
-		fmt.Fprintf(os.Stderr, "cliproxy-rotator: host.log failed: %v\n", errCall)
+		if hostAttached.Load() {
+			fmt.Fprintf(os.Stderr, "cliproxy-rotator: host.log failed: %v\n", errCall)
+		}
 		return
 	}
 	var env envelope
 	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal == nil && !env.OK && env.Error != nil {
-		fmt.Fprintf(os.Stderr, "cliproxy-rotator: host.log rejected: %s: %s\n", env.Error.Code, env.Error.Message)
+		if hostAttached.Load() {
+			fmt.Fprintf(os.Stderr, "cliproxy-rotator: host.log rejected: %s: %s\n", env.Error.Code, env.Error.Message)
+		}
+		return
 	}
+	hostAttached.Store(true)
 }
 
 func socketDebug() string {

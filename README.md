@@ -69,6 +69,7 @@ plugins:
         interface: he-ipv6
         pool_size: 2048
         socks_file: /home/saboor/.cache/zen-egress/socks.txt
+        selection: round-robin # round-robin (default) | fastest
       models:
         - id: rotator/particle-1-free
           upstream: "particle-ai/particle-1:free"
@@ -93,6 +94,57 @@ python3 tools/generate_kilo_config.py --format snippet  # openai-compatibility p
 | `socks` | Round-robins the SOCKS5 exits listed in `socks_file` (produced by `zen-egress-pool`). |
 | `direct` | No rotation (control path). |
 | `auto` | Probes the host's AAAA once (cached 10 min): IPv6 if v6-reachable, else SOCKS, else direct. |
+
+### Exit selection
+
+`egress.selection` decides which exit carries a request:
+
+| Value | Behaviour |
+| --- | --- |
+| `round-robin` (default) | Walks the pool in order, so consecutive requests leave through different source addresses. This is what spreads a per-IP free-tier limit over the whole pool. |
+| `fastest` | Picks the exit with the lowest observed latency (EWMA + failure penalty). |
+
+A parked exit (rate-limited or unreachable) is skipped by both strategies; the
+warm ring is consulted first, so a request usually finds a socket that is
+already open.
+
+### The `/48` only reaches IPv6 upstreams
+
+The routed `/48` is used when the upstream has an AAAA record
+(`api.apinex.bond` does). `api.kilo.ai` and `integrate.api.nvidia.com` publish
+**no** AAAA record, and the laptop has no NAT64/464XLAT, so those upstreams
+always leave through the SOCKS pool. Kilo egress diversity therefore comes
+from the zen pool, not from the IPv6 addresses.
+
+### Background probe and dead-exit parking
+
+The live pool file mixes working multiplexer users with raw proxies that died
+minutes ago. Without a probe the plugin would only learn that a proxy is dead
+by paying its dial timeout inside a real request — up to 8 s per dead exit,
+which showed up as 26–90 s spikes.
+
+So the plugin probes every exit in the background at startup, against the
+upstream it is configured for:
+
+- an exit that cannot reach the upstream is parked (`parkDead`): 5 min, then
+  15 min, then 30 min as it keeps failing;
+- an exit that answers is released immediately (`succeed`), so a proxy that
+  comes back rejoins the pool;
+- only one probe round runs at a time, and a reconfigure that keeps the same
+  egress settings **reuses the pool**, so the parked exits, the warm ring and
+  the latency history survive the host re-applying the configuration (the host
+  does that five times during startup);
+- when the pool file changes, the exits that are still in it keep their state
+  and only the new ones are probed.
+
+The summary is logged through `host.log` and mirrored on stderr:
+
+```text
+cliproxy-rotator: probed 36 proxy exit(s) against api.kilo.ai:443: 32 reachable
+```
+
+Set `CLIPROXY_ROTATOR_DEBUG=1` to get the per-exit probe trace and the chosen
+exit of every request.
 
 Address assignment and exit discovery live outside the plugin:
 
@@ -212,8 +264,10 @@ client stream, either with data + `[DONE]` or with a retryable error chunk.
 - Per-slot exponential backoff `2s → 128s`, capped at 2 min (`health.go`).
 - Per-exit cooldowns (`parkFor`) bounded at 5 min; a 429 parks the *exit*, not
   the endpoint, so the next request simply uses another exit.
-- Exits are re-probed by the pool every 5 min; the list is hot-reloaded when
-  `socks_file` changes (mtime check every 60 s).
+- Unreachable exits are parked by the background probe (5/15/30 min) and by the
+  request path itself, so a dead proxy never costs a request its dial timeout.
+- The socks list is hot-reloaded when `socks_file` changes (mtime check every
+  60 s); the exits that stay in it keep their health, parking and warm socket.
 - Keep-alives: `MaxIdleConnsPerHost: 8`, `IdleConnTimeout: 5m` per exit, plus
   the warm ring, so ~30 concurrent requests reuse warm connections instead of
   re-dialling (HTTP/2 multiplexes them over the ring's sockets).
@@ -238,7 +292,13 @@ built from; `go.mod` points at `../CLIProxyAPI` (stock upstream checkout).
 - `POST /v1/chat/completions` (non-stream) → 200 through a rotating exit.
 - `stream: true` → full chunk stream, `finish_reason` and `[DONE]`.
 - `/v1/messages` (Claude protocol) → 200, translated by the host, not the plugin.
+- `/v1/responses` (Codex protocol) → 200, translated by the host.
 - 20 concurrent requests (10 rotating + 10 direct) → 20 × 200 in 1.5 s.
 - Unreachable endpoint → fails in <1 s with `retryable=true` and the attempt log.
 - `api.kilo.ai` (IPv4-only) → automatically uses the SOCKS pool.
 - `api.apinex.bond` (AAAA) with `egress: ipv6` → dials from the `/48` pool.
+- 12 sequential requests → mean 1.49 s, max 2.72 s (before the background
+  probe: mean 12.8 s, max 90 s).
+- 15 concurrent requests → 15 × 200 in 9.45 s (before: 57 s).
+- 8 consecutive requests → 8 distinct exit addresses (the round-robin
+  selection really does spread the per-IP limit).
